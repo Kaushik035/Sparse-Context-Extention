@@ -38,6 +38,12 @@ class SPIREConfig:
     truncate_context_tokens: int = 0    # 0 = no truncation; set to 4096 for B3 baseline
     attn_retrieval_max_seq: int = 1500  # raise to 4096 on A100 so B7 uses real attention
 
+    # Phase 3 B8 / B9 — dense and hybrid retrieval
+    # B8: pure cosine-similarity retrieval with a sentence-transformer model
+    # B9: hybrid BM25 + cosine (weighted combination, score-normalised)
+    dense_retriever_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    hybrid_dense_weight: float = 0.5    # weight for cosine score in hybrid (1-w for BM25)
+
     # Evaluation
     num_examples: int = 1  # quick validation; change to 10/100 for real runs
     output_dir: str = "results/phase1"

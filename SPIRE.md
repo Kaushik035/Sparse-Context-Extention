@@ -217,7 +217,9 @@ We use two retrieval scales to stress-test context utilization at different wind
 | B4 | IRCoT-Summarize | IRCoT but after each cycle, summarize all prior cycles into a short paragraph and drop originals |
 | B5 | SPIRE-Sink+Local | Sparse but no hash selection (ablation — tests if local window alone suffices) |
 | B6 | SPIRE-Full | Ours: sink + local window + hash sparse over old cycles |
-| B7 | SPIRE-Adaptive | Ours + adaptive window sizing per cycle |
+| B7 | SPIRE + Attention Retrieval | Ours + attention-guided retrieval replacing BM25 at each hop |
+| B8 | Cosine Retrieval | Dense IRCoT with BM25 replaced by cosine-similarity retrieval (`sentence-transformers/all-MiniLM-L6-v2`). Tests whether semantic embeddings improve passage selection over keyword overlap |
+| B9 | Hybrid (BM25 + Cosine) | Dense IRCoT with min-max fused BM25 + cosine retriever (equal weight). Tests whether combining keyword and semantic signals is complementary |
 
 #### Metrics
 
@@ -235,25 +237,29 @@ We use two retrieval scales to stress-test context utilization at different wind
 
 ```
 F1
- │  ● Dense IRCoT
- │  ■ SPIRE (ours)
- │  ▲ IRCoT-Truncate
+ │  ● Dense IRCoT (B2)
+ │  ■ SPIRE+Attn (B7, ours)
+ │  ▲ IRCoT-Truncate (B3)
+ │  ◆ Cosine (B8)
+ │  ✦ Hybrid BM25+Cosine (B9)
  │
- ●■▲
- │   ●■▲
- │     ●■ ▲
- │       ●  ■  ▲     ← truncation collapses; SPIRE degrades gracefully
- │          ●   ■
- └────────────────────
+ ●■◆✦▲
+ │      ●■◆✦▲
+ │          ●■ ◆✦ ▲
+ │            ●   ■  ◆✦  ▲     ← truncation collapses; SPIRE degrades gracefully
+ │                ●    ■
+ └────────────────────────────
    1   2   3   4   5   hop depth  (on MuSiQue-Long)
 
-  ● Dense IRCoT   ■ SPIRE (ours)   ▲ IRCoT-Truncate
+  ● Dense IRCoT   ■ SPIRE+Attn (ours)   ▲ IRCoT-Truncate   ◆ Cosine   ✦ Hybrid
 ```
 
 If SPIRE maintains higher F1 at deeper hops where dense IRCoT and truncation degrade — that
 is the paper. The story: **sparse attention lets multi-hop RAG fit more productive hops into
 the limited context window — old content stays accessible without wasting attention budget,
-unlike dense (wastes budget) or truncation (loses information).**
+unlike dense (wastes budget) or truncation (loses information).** B8/B9 isolate whether the
+retrieval signal (semantic vs keyword) independently explains any gap, separate from the
+attention mechanism used during generation.
 
 ---
 
@@ -663,7 +669,7 @@ spire_config = ResearchAttentionConfig(
 |---|---|
 | **Primary dataset** | MuSiQue-Long (realistic chunk sizes, 10K–20K context at hop 5) |
 | **OOD dataset** | 2WikiMultihopQA |
-| **Baselines** | Retrieve-Once · IRCoT-Dense · IRCoT-Truncate · IRCoT-Summarize · SPIRE |
+| **Baselines** | Retrieve-Once (B1) · IRCoT-Dense (B2) · IRCoT-Truncate (B3) · SPIRE-Full (B6) · SPIRE+Attention (B7) · Cosine (B8) · Hybrid BM25+Cosine (B9) |
 | **Key metric** | F1 at each hop depth: 1 / 2 / 3 / 4 |
 | **Secondary** | KV memory, prefill latency, total tokens consumed |
 
@@ -671,20 +677,21 @@ spire_config = ResearchAttentionConfig(
 
 ```
 F1
- │ ●■▲
- │    ●■ ▲
- │      ●■  ▲
- │        ●  ■  ▲     ← truncation drops; dense dilutes; SPIRE holds
- │           ●   ■
- └─────────────────────
+ │ ●■◆✦▲
+ │       ●■◆✦ ▲
+ │           ●■  ◆✦  ▲
+ │             ●   ■   ◆✦   ▲   ← truncation drops; SPIRE holds; B8/B9 isolate retrieval effect
+ │                 ●     ■
+ └──────────────────────────────
    1   2   3   4   5   hop depth
 
-  ● Dense IRCoT   ■ SPIRE (ours)   ▲ IRCoT-Truncate
+  ● Dense IRCoT (B2)   ■ SPIRE+Attn (B7)   ▲ Truncate (B3)   ◆ Cosine (B8)   ✦ Hybrid (B9)
 ```
 
 **The story:** Sparse attention optimizes how the limited context window is spent — old content
-stays accessible (unlike truncation) but doesn't waste attention budget (unlike dense). The
-model can go deeper in multi-hop reasoning within the same window.
+stays accessible (unlike truncation) but doesn't waste attention budget (unlike dense). B8/B9
+isolate whether the *retrieval signal* (semantic vs keyword) independently drives accuracy,
+decoupled from the *attention mechanism* used during generation.
 
 ---
 

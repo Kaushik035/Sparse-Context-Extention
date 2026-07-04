@@ -3,6 +3,7 @@ transformers>=4.40
 accelerate
 datasets
 rank-bm25
+sentence-transformers>=2.7
 evaluate
 matplotlib
 tqdm

@@ -61,7 +61,7 @@ This allows more productive reasoning hops to fit into the same context window w
 |---|---|---|
 | Phase 1 | Reproduce IRCoT on MuSiQue, profile context growth and F1 degradation | **Complete** |
 | Phase 2 | Add sparse attention (SPIRE) and compare against dense baselines | **Complete** |
-| Phase 3 | Replace BM25 with attention-guided retrieval; 5-way comparison including B7 SPIRE+Attention | **Complete** |
+| Phase 3 | 7-way comparison: attention-guided retrieval (B7) + dense retrieval (B8 cosine, B9 hybrid) | **Complete** |
 
 ---
 
@@ -83,12 +83,13 @@ SURP/
 │   ├── retriever.py                # BM25 retriever
 │   ├── ircot_loop.py               # IRCoT loop — switches between dense/sparse via config
 │   ├── evaluator.py                # F1 / EM evaluation utilities
-│   └── sparse_attention.py         # Phase 2: SPIRE sparse mask builder + visualiser
+│   ├── sparse_attention.py         # Phase 2: SPIRE sparse mask builder + visualiser
+│   └── dense_retriever.py          # Phase 3 (B8/B9): cosine and hybrid retrieval
 │
 ├── scripts/
 │   ├── run_phase1.py               # Phase 1: dense IRCoT baseline
 │   ├── run_phase2.py               # Phase 2: dense vs SPIRE-B5 vs SPIRE-B6
-│   └── run_phase3.py               # Phase 3: 5-way comparison + attention retrieval
+│   └── run_phase3.py               # Phase 3: 7-way comparison including B8/B9
 │
 ├── data/
 │   └── musique/                    # Auto-downloaded on first run
@@ -640,6 +641,22 @@ The `AttentionRetriever` class.
 | `_build_input(question, reasoning_text)` | Tokenise `[prefix \| p₀ \| p₁ \| … \| reasoning]` and return `(input_ids, passage_ranges, reasoning_range)` |
 | `_score_passages(attentions, passage_ranges, reasoning_range)` | For each target layer and each passage, compute the max-then-mean attention score; average over layers; return a score list |
 
+#### `src/dense_retriever.py` — NEW
+
+Houses the two semantic retrieval baselines added in Phase 3.
+
+**`CosineRetriever` (B8):**
+- `__init__(passages, model_name, st_model=None)` — encodes all passages once with a `sentence-transformers` model (default: `all-MiniLM-L6-v2`, 384-dim). Embeddings are L2-normalised and stored on CPU. Accepts a pre-built `SentenceTransformer` instance via `st_model` to avoid reloading the model per example.
+- `retrieve(query, top_k)` — encodes the query, computes dot-product cosine similarity against all passage embeddings, returns top-k by score.
+
+**`HybridRetriever` (B9):**
+- `__init__(passages, bm25_retriever, model_name, dense_weight, st_model=None)` — stores a `BM25Retriever` reference and builds a `CosineRetriever` over the same passage pool.
+- `retrieve(query, top_k)` — computes BM25 raw scores and cosine scores for all passages independently; min-max normalises each to [0, 1]; fuses as `w × cosine_norm + (1−w) × bm25_norm` where `w = dense_weight` (default 0.5); returns top-k by fused score.
+
+Both classes expose `.retrieve(query, top_k)` — the same interface as `BM25Retriever` — so they drop directly into `IRCoTLoop` without any loop modifications.
+
+`sentence-transformers` is imported lazily inside `__init__` so Phase 1/2 runs that have not installed the new dependency are unaffected at import time.
+
 #### `src/ircot_loop.py` — PATCHED
 
 Three changes, all backward-compatible:
@@ -703,8 +720,17 @@ Orchestrates the five-configuration comparison. Key design decisions:
 | B3 | IRCoT-Truncate | `truncate_context_tokens=4096` | Dense IRCoT but accumulated evidence + reasoning truncated to last 4 096 tokens. **Naïve compression baseline** — shows that simply discarding old context hurts accuracy |
 | B6 | SPIRE-Full | `use_sparse=True, hash_budget=256` | Phase 2 sparse attention. Loaded from Phase 2 if available |
 | B7 | SPIRE + Attention | `use_sparse=True, use_attention_retrieval=True` | **Phase 3 novel contribution.** Combines Phase 2 sparse generation with Phase 3 attention-guided retrieval |
+| B8 | Cosine Retrieval | `retrieval_mode="cosine"` | Dense IRCoT but BM25 replaced by cosine-similarity retrieval using `sentence-transformers/all-MiniLM-L6-v2`. Tests whether semantic embedding signals improve multi-hop passage selection |
+| B9 | Hybrid (BM25 + Cosine) | `retrieval_mode="hybrid"` | Dense IRCoT with a min-max fused BM25 + cosine retriever (equal weight by default). Tests whether combining keyword and semantic signals is complementary |
 
-The intended result: **B7 ≥ B6 > B2 > B3 > B1** on F1, particularly at deeper hop depths (3-hop, 4-hop). B3's F1 degrading relative to B2 validates that truncation is harmful. B7 improving over B6 validates that attention-guided retrieval adds signal beyond what BM25 provides under the sparse attention regime.
+The intended result ordering: **B7 ≥ B6 > B9 ≥ B8 ≥ B2 > B3 > B1** on F1 at deeper hops. B3's F1 degrading relative to B2 validates that truncation is harmful. B7 improving over B6 validates attention-guided retrieval. B9 ≥ B8 ≥ B2 would validate that semantic signals complement BM25 — or if B8/B9 ≤ B2, that keyword overlap is sufficient for MuSiQue's short passages.
+
+Key config fields for B8/B9 (in `config.py`):
+
+| Field | Default | Description |
+|---|---|---|
+| `dense_retriever_model` | `sentence-transformers/all-MiniLM-L6-v2` | Sentence-transformer model used for cosine embeddings in B8/B9 |
+| `hybrid_dense_weight` | `0.5` | Weight `w` for the cosine component in B9 (0 = pure BM25, 1 = pure cosine) |
 
 ---
 
@@ -760,7 +786,7 @@ Evaluator → f1_by_hops, overall_f1, overall_em for all 5 configs
         │
         ▼
 results/phase3/run_<timestamp>.json
-results/phase3/f1_by_hop_<timestamp>.png          (B1/B2/B3/B6/B7 on same axes)
+results/phase3/f1_by_hop_<timestamp>.png          (B1/B2/B3/B6/B7/B8/B9 on same axes)
 results/phase3/context_tokens_<timestamp>.png     (context growth sanity check)
 results/phase3/memory_<timestamp>.png             (GPU memory per hop)
 results/phase3/attn_heatmap_<timestamp>.png       (attention map for first example)
@@ -772,8 +798,8 @@ results/phase3/attn_heatmap_<timestamp>.png       (attention map for first examp
 
 | File | Contents |
 |---|---|
-| `run_<timestamp>.json` | Per-example results for all 5 configs, aggregated F1/EM metrics, GPU memory per hop, gold answers, hop depths |
-| `f1_by_hop_<timestamp>.png` | **Key comparison figure** — F1 vs hop depth for B1/B2/B3/B6/B7 on one set of axes |
+| `run_<timestamp>.json` | Per-example results for all 7 configs, aggregated F1/EM metrics, GPU memory per hop, gold answers, hop depths |
+| `f1_by_hop_<timestamp>.png` | **Key comparison figure** — F1 vs hop depth for all 7 baselines (B1/B2/B3/B6/B7/B8/B9) on one set of axes |
 | `context_tokens_<timestamp>.png` | Average context growth per hop (sanity check) |
 | `memory_<timestamp>.png` | GPU memory per hop — compare B6 vs B7 to check attention retrieval memory cost |
 | `attn_heatmap_<timestamp>.png` | Attention map (last target layer, averaged over heads) for the first example — diagnostic showing which passage tokens the reasoning tokens attended to |
@@ -782,18 +808,22 @@ The JSON structure for Phase 3:
 ```json
 {
   "base_config": { "use_sparse": false, "use_attention_retrieval": false, ... },
-  "configs_run": ["retrieve_once", "dense", "truncate_b3", "spire_b6", "spire_attn"],
+  "configs_run": ["retrieve_once", "dense", "truncate_b3", "spire_b6", "spire_attn", "cosine_b8", "hybrid_b9"],
   "metrics_by_config": {
     "retrieve_once": { "overall_f1": 0.xx, "overall_em": 0.xx, "f1_by_hops": { "2": ..., "3": ... } },
     "dense":         { ... },
     "truncate_b3":   { ... },
     "spire_b6":      { ... },
-    "spire_attn":    { "overall_f1": 0.xx, "overall_em": 0.xx, "f1_by_hops": { ... } }
+    "spire_attn":    { "overall_f1": 0.xx, "overall_em": 0.xx, "f1_by_hops": { ... } },
+    "cosine_b8":     { "overall_f1": 0.xx, "overall_em": 0.xx, "f1_by_hops": { ... } },
+    "hybrid_b9":     { "overall_f1": 0.xx, "overall_em": 0.xx, "f1_by_hops": { ... } }
   },
-  "memory_by_config": { "dense": [...], "spire_b6": [...], "spire_attn": [...] },
+  "memory_by_config": { "dense": [...], "spire_b6": [...], "spire_attn": [...], "cosine_b8": [...], "hybrid_b9": [...] },
   "results_by_config": { "retrieve_once": [...], ... },
   "gold_answers": [...],
   "hop_depths": [...],
+  "dense_retriever_model": "sentence-transformers/all-MiniLM-L6-v2",
+  "hybrid_dense_weight": 0.5,
   "phase": 3
 }
 ```
@@ -905,16 +935,18 @@ python scripts/run_phase3.py
 ```
 
 **What the script does automatically:**
-1. Loads the model once (shared across all 5 configs).
+1. Loads the model once (shared across all 7 configs).
 2. Loads MuSiQue (cached from Phase 1).
 3. Checks `results/phase1/` for a B2 dense run — reuses it if found.
 4. Checks `results/phase2/` for a B6 SPIRE-Full run — reuses it if found.
 5. Runs **B1** (retrieve-once) fresh.
 6. Runs **B3** (IRCoT-Truncate, `truncate_context_tokens=4096`) fresh.
 7. Runs **B7** (SPIRE + Attention Retrieval) fresh — this is the slowest config.
-8. Generates the attention heatmap for the first example (skipped automatically if the sequence exceeds `attn_retrieval_max_seq`).
-9. Saves all results and 4 plots to `results/phase3/`.
-10. Prints the final 5-way F1/EM summary table.
+8. Runs **B8** (Cosine Retrieval) — loads `sentence-transformers/all-MiniLM-L6-v2` once, encodes passages per example.
+9. Runs **B9** (Hybrid BM25+Cosine) — same embedding model, fuses BM25 and cosine scores 50/50 by default.
+10. Generates the attention heatmap for the first example (skipped automatically if the sequence exceeds `attn_retrieval_max_seq`).
+11. Saves all results and 4 plots to `results/phase3/`.
+12. Prints the final 7-way F1/EM summary table.
 
 **Important:** On a CPU laptop, B7 falls back to BM25 because MuSiQue passage pools are too long for the default `attn_retrieval_max_seq=1500` guard. The run will still complete correctly; B7 will behave like B6 on the laptop. On the A100, raise `attn_retrieval_max_seq` to `4096` to use real attention retrieval.
 
@@ -922,9 +954,9 @@ python scripts/run_phase3.py
 
 | Hardware | Model | Examples | Estimated time |
 |---|---|---|---|
-| Laptop (CPU) | Llama-3.2-1B | 1 | ~15 min (B7 slow due to sparse generation) |
+| Laptop (CPU) | Llama-3.2-1B | 1 | ~15 min (B7 slowest; B8/B9 ~1 min each once model cached) |
 | Laptop (CPU) | Llama-3.2-1B | 10 | ~2–3 hours |
-| A100-40GB | Llama-3.1-8B | 100 | ~4–6 hours (B7 with real attention retrieval) |
+| A100-40GB | Llama-3.1-8B | 100 | ~4–6 hours (B7 with real attention retrieval; B8/B9 add ~30 min) |
 
 ---
 
@@ -1009,6 +1041,8 @@ All parameters live in `config.py` and apply across all phases:
 | `use_attention_retrieval` | `False` | **(Phase 3)** `False` → BM25 retrieval (Phases 1/2 behaviour). `True` → attention-map-guided retrieval via `AttentionRetriever` |
 | `truncate_context_tokens` | `0` | **(Phase 3)** 0 = no truncation. Set to `4096` for B3 (IRCoT-Truncate) baseline |
 | `attn_retrieval_max_seq` | `1500` | **(Phase 3)** Max tokenised sequence length before falling back to BM25. Raise to `4096` on A100 for real attention retrieval |
+| `dense_retriever_model` | `sentence-transformers/all-MiniLM-L6-v2` | **(Phase 3 B8/B9)** Sentence-transformer model for cosine and hybrid retrieval |
+| `hybrid_dense_weight` | `0.5` | **(Phase 3 B9)** Weight `w` for the cosine component in hybrid fusion. 0 = pure BM25, 1 = pure cosine |
 
 ---
 

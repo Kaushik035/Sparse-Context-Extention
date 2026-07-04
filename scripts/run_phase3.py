@@ -35,6 +35,7 @@ from tqdm import tqdm
 
 from config import SPIREConfig
 from src.attention_retriever import AttentionRetriever
+from src.dense_retriever import CosineRetriever, HybridRetriever
 from src.evaluator import Evaluator
 from src.ircot_loop import IRCoTLoop
 from src.model_manager import ModelManager
@@ -159,15 +160,21 @@ def run_ircot(
     examples: List[Dict],
     label: str,
     use_attention: bool = False,
+    retrieval_mode: str = "bm25",
+    st_model=None,  # pre-built SentenceTransformer; shared across B8 and B9 calls
 ) -> Tuple[List[Dict], List[float]]:
     """Run IRCoT on all examples under the given config.
 
     Args:
-        config:         SPIREConfig instance for this run (all flags set).
-        model_manager:  Shared model.
-        examples:       MuSiQue examples.
-        label:          Display label for tqdm.
-        use_attention:  When True, builds AttentionRetriever per example.
+        config:          SPIREConfig instance for this run (all flags set).
+        model_manager:   Shared model.
+        examples:        MuSiQue examples.
+        label:           Display label for tqdm.
+        use_attention:   When True, builds AttentionRetriever per example (B7).
+        retrieval_mode:  One of "bm25" (default), "cosine" (B8), "hybrid" (B9).
+                         Controls which retriever is used inside the IRCoT loop.
+                         Attention retrieval (B7) always takes priority when
+                         use_attention=True regardless of this setting.
 
     Returns:
         (results, avg_gpu_memory_per_hop)
@@ -178,6 +185,21 @@ def run_ircot(
     results: List[Dict] = []
     memory_by_hop: Dict[int, List[float]] = defaultdict(list)
 
+    # Pre-load the sentence-transformer model once outside the example loop so
+    # we pay the model-load cost only once regardless of num_examples.
+    # If a pre-built model was passed from main(), use it directly.
+    _st_model = st_model
+    if _st_model is None and retrieval_mode in ("cosine", "hybrid"):
+        try:
+            from sentence_transformers import SentenceTransformer as _ST
+        except ImportError as exc:
+            raise ImportError(
+                "sentence-transformers is required for B8/B9. "
+                "Run: pip install sentence-transformers>=2.7"
+            ) from exc
+        _st_model = _ST(config.dense_retriever_model)
+        logging.info("Loaded sentence-transformer: %s", config.dense_retriever_model)
+
     for example in tqdm(examples, desc=f"Phase 3 [{label}]"):
         question = example.get("question", "")
         passages = get_passages(example)
@@ -185,6 +207,24 @@ def run_ircot(
             continue
 
         bm25 = BM25Retriever(passages=passages)
+
+        # Build the primary retriever for this mode.
+        if retrieval_mode == "cosine":
+            primary_retriever = CosineRetriever(
+                passages=passages,
+                model_name=config.dense_retriever_model,
+                st_model=_st_model,
+            )
+        elif retrieval_mode == "hybrid":
+            primary_retriever = HybridRetriever(
+                passages=passages,
+                bm25_retriever=bm25,
+                model_name=config.dense_retriever_model,
+                dense_weight=config.hybrid_dense_weight,
+                st_model=_st_model,
+            )
+        else:  # "bm25" — default, covers B1-B7
+            primary_retriever = bm25
 
         attn_retriever: Optional[AttentionRetriever] = None
         if use_attention:
@@ -197,7 +237,7 @@ def run_ircot(
 
         loop = IRCoTLoop(
             model=model_manager,
-            retriever=bm25,
+            retriever=primary_retriever,
             config=config,
             attention_retriever=attn_retriever,
         )
@@ -389,11 +429,13 @@ def save_attention_heatmap(
 def plot_f1_comparison(metrics_map: Dict[str, Dict], output_path: Path) -> None:
     """Plot F1 vs hop depth for all 5 baselines."""
     styles = {
-        "retrieve_once": ("D", "#9467bd", ":", "B1 Retrieve-Once"),
-        "dense":         ("o", "#1f77b4", "-", "B2 Dense IRCoT"),
+        "retrieve_once": ("D", "#9467bd", ":",  "B1 Retrieve-Once"),
+        "dense":         ("o", "#1f77b4", "-",  "B2 Dense IRCoT"),
         "truncate_b3":   ("v", "#d62728", "--", "B3 IRCoT-Truncate"),
         "spire_b6":      ("^", "#2ca02c", "-.", "B6 SPIRE-Full"),
-        "spire_attn":    ("s", "#ff7f0e", "-", "B7 SPIRE+Attention"),
+        "spire_attn":    ("s", "#ff7f0e", "-",  "B7 SPIRE+Attention"),
+        "cosine_b8":     ("P", "#8c564b", "--", "B8 Cosine"),
+        "hybrid_b9":     ("X", "#17becf", "-",  "B9 Hybrid (BM25+Cosine)"),
     }
 
     plt.figure(figsize=(10, 5))
@@ -425,6 +467,8 @@ def plot_memory(memory_map: Dict[str, List[float]], output_path: Path) -> None:
         "truncate_b3": ("#d62728", "--", "B3 Truncate"),
         "spire_b6":    ("#2ca02c", "-.", "B6 SPIRE-Full"),
         "spire_attn":  ("#ff7f0e", "-",  "B7 SPIRE+Attn"),
+        "cosine_b8":   ("#8c564b", "--", "B8 Cosine"),
+        "hybrid_b9":   ("#17becf", "-",  "B9 Hybrid"),
     }
     plt.figure(figsize=(10, 5))
     for key, vals in memory_map.items():
@@ -593,6 +637,55 @@ def main() -> None:
     logging.info("[B7] F1=%.4f  EM=%.4f", metrics_by_config["spire_attn"]["overall_f1"],
                  metrics_by_config["spire_attn"]["overall_em"])
 
+    # ----
+    # B8 — Cosine Retrieval (dense semantic baseline)
+    # Dense IRCoT loop where BM25 is replaced by sentence-transformer cosine similarity.
+    # Tests whether semantic matching improves over keyword matching.
+    # ----
+    logging.info("Running B8 (cosine retrieval) with model: %s",
+                 base_config.dense_retriever_model)
+    # Load the sentence-transformer once and reuse for both B8 and B9.
+    try:
+        from sentence_transformers import SentenceTransformer as _SharedST
+    except ImportError as exc:
+        raise ImportError(
+            "sentence-transformers is required for B8/B9. "
+            "Run: pip install sentence-transformers>=2.7"
+        ) from exc
+    shared_st_model = _SharedST(base_config.dense_retriever_model)
+    logging.info("Loaded shared sentence-transformer: %s", base_config.dense_retriever_model)
+
+    cfg_b8 = replace(base_config, use_sparse=False, use_attention_retrieval=False,
+                     truncate_context_tokens=0)
+    r8, mem8 = run_ircot(cfg_b8, model_manager, examples, "B8 cosine",
+                          retrieval_mode="cosine", st_model=shared_st_model)
+    results_by_config["cosine_b8"] = r8
+    memory_by_config["cosine_b8"] = mem8
+    metrics_by_config["cosine_b8"] = evaluator.evaluate_results(
+        r8, gold_answers[:len(r8)], hop_depths[:len(r8)]
+    )
+    logging.info("[B8] F1=%.4f  EM=%.4f", metrics_by_config["cosine_b8"]["overall_f1"],
+                 metrics_by_config["cosine_b8"]["overall_em"])
+
+    # ----
+    # B9 — Hybrid Retrieval (BM25 + cosine, equal weight by default)
+    # Tests whether the two retrieval signals are complementary.
+    # Expected: B9 >= B8 and B9 >= B2 (BM25-only dense) when both agree.
+    # ----
+    logging.info("Running B9 (hybrid retrieval) dense_weight=%.2f",
+                 base_config.hybrid_dense_weight)
+    cfg_b9 = replace(base_config, use_sparse=False, use_attention_retrieval=False,
+                     truncate_context_tokens=0)
+    r9, mem9 = run_ircot(cfg_b9, model_manager, examples, "B9 hybrid",
+                          retrieval_mode="hybrid", st_model=shared_st_model)
+    results_by_config["hybrid_b9"] = r9
+    memory_by_config["hybrid_b9"] = mem9
+    metrics_by_config["hybrid_b9"] = evaluator.evaluate_results(
+        r9, gold_answers[:len(r9)], hop_depths[:len(r9)]
+    )
+    logging.info("[B9] F1=%.4f  EM=%.4f", metrics_by_config["hybrid_b9"]["overall_f1"],
+                 metrics_by_config["hybrid_b9"]["overall_em"])
+
     # ---- Attention heatmap (first example, diagnostic) ----
     heatmap_path = output_dir / f"attn_heatmap_{timestamp}.png"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -605,7 +698,11 @@ def main() -> None:
     # ---- Save results ----
     payload = {
         "base_config":       vars(base_config),
-        "configs_run":       list(results_by_config.keys()),
+        "configs_run":       [
+            "retrieve_once", "dense", "truncate_b3",
+            "spire_b6", "spire_attn",
+            "cosine_b8", "hybrid_b9",
+        ],
         "metrics_by_config": metrics_by_config,
         "memory_by_config":  memory_by_config,
         "results_by_config": results_by_config,
@@ -613,6 +710,8 @@ def main() -> None:
         "hop_depths":        hop_depths,
         "timestamp":         datetime.now().isoformat(timespec="seconds"),
         "model_name":        base_config.model_name,
+        "dense_retriever_model": base_config.dense_retriever_model,
+        "hybrid_dense_weight":   base_config.hybrid_dense_weight,
         "phase":             3,
     }
     save_outputs(payload, output_dir, timestamp)
@@ -621,7 +720,11 @@ def main() -> None:
     logging.info("\n%s", "=" * 60)
     logging.info("%-18s  %8s  %8s", "Config", "F1", "EM")
     logging.info("-" * 60)
-    for key in ["retrieve_once", "dense", "truncate_b3", "spire_b6", "spire_attn"]:
+    for key in [
+        "retrieve_once", "dense", "truncate_b3",
+        "spire_b6", "spire_attn",
+        "cosine_b8", "hybrid_b9",
+    ]:
         if key in metrics_by_config:
             m = metrics_by_config[key]
             logging.info("%-18s  %8.4f  %8.4f", key, m["overall_f1"], m["overall_em"])

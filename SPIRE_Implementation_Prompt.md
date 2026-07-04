@@ -617,15 +617,28 @@ Compare all methods:
 - B2: IRCoT-Dense (Phase 1)
 - B3: IRCoT-Truncate (truncate to last 4K tokens)
 - B6: SPIRE-Full (Phase 2)
-- B7: SPIRE-Adaptive + Attention Retrieval (Phase 3)
+- B7: SPIRE + Attention Retrieval (Phase 3)
+- B8: Cosine Retrieval — BM25 replaced by `sentence-transformers/all-MiniLM-L6-v2` cosine similarity
+- B9: Hybrid (BM25 + Cosine) — min-max fused retriever, equal weight by default
 
 ### Phase 3 Deliverables
 
 - [ ] Attention extraction works (visualize attention heatmap for one example)
 - [ ] Attention-guided retrieval finds relevant passages
-- [ ] Full comparison table: all baselines vs SPIRE variants
-- [ ] Final plots: F1 vs hop depth for all methods
+- [ ] `src/dense_retriever.py` — `CosineRetriever` (B8) and `HybridRetriever` (B9) with shared `SentenceTransformer` model (loaded once per run)
+- [ ] Full comparison table: all 7 baselines vs SPIRE variants
+- [ ] Final plots: F1 vs hop depth for all 7 methods on one set of axes
 - [ ] Results saved to `results/phase3/`
+
+**New config fields required for B8/B9:**
+```python
+dense_retriever_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+hybrid_dense_weight: float = 0.5
+```
+**New dependency required:**
+```
+sentence-transformers>=2.7
+```
 
 ---
 
