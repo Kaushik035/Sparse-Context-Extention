@@ -22,9 +22,19 @@
   - [Baselines Run in Phase 2](#baselines-run-in-phase-2)
   - [Phase 2 Data Flow](#phase-2-data-flow)
   - [Phase 2 Outputs](#phase-2-outputs)
+- [Phase 3 — Attention-Guided Retrieval](#phase-3--attention-guided-retrieval)
+  - [Why Phase 3 Is Needed](#why-phase-3-is-needed)
+  - [The Core Idea — Retrieval as Self-Attention Readout](#the-core-idea--retrieval-as-self-attention-readout)
+  - [How AttentionRetriever Works Technically](#how-attentionretriever-works-technically)
+  - [Memory Safety and the BM25 Fallback](#memory-safety-and-the-bm25-fallback)
+  - [Files Added or Patched in Phase 3](#files-added-or-patched-in-phase-3)
+  - [Baselines Run in Phase 3](#baselines-run-in-phase-3)
+  - [Phase 3 Data Flow](#phase-3-data-flow)
+  - [Phase 3 Outputs](#phase-3-outputs)
 - [Setup and Installation](#setup-and-installation)
 - [Running Phase 1](#running-phase-1)
 - [Running Phase 2](#running-phase-2)
+- [Running Phase 3](#running-phase-3)
 - [Running on a GPU / Cloud Machine](#running-on-a-gpu--cloud-machine)
 - [Configuration Reference](#configuration-reference)
 - [Security Notes](#security-notes)
@@ -51,7 +61,7 @@ This allows more productive reasoning hops to fit into the same context window w
 |---|---|---|
 | Phase 1 | Reproduce IRCoT on MuSiQue, profile context growth and F1 degradation | **Complete** |
 | Phase 2 | Add sparse attention (SPIRE) and compare against dense baselines | **Complete** |
-| Phase 3 | Replace BM25 with attention-guided retrieval | Planned |
+| Phase 3 | Replace BM25 with attention-guided retrieval; 5-way comparison including B7 SPIRE+Attention | **Complete** |
 
 ---
 
@@ -78,14 +88,15 @@ SURP/
 ├── scripts/
 │   ├── run_phase1.py               # Phase 1: dense IRCoT baseline
 │   ├── run_phase2.py               # Phase 2: dense vs SPIRE-B5 vs SPIRE-B6
-│   └── run_phase3.py               # Phase 3 (planned)
+│   └── run_phase3.py               # Phase 3: 5-way comparison + attention retrieval
 │
 ├── data/
 │   └── musique/                    # Auto-downloaded on first run
 │
 └── results/
     ├── phase1/                     # Phase 1 JSON artifacts + plots
-    └── phase2/                     # Phase 2 JSON artifacts + comparison plots
+    ├── phase2/                     # Phase 2 JSON artifacts + comparison plots
+    └── phase3/                     # Phase 3 JSON artifacts + 5-way comparison plots
 ```
 
 ---
@@ -396,7 +407,7 @@ else:
 
 #### `config.py` — PATCHED
 
-Added `use_attention_retrieval: bool = False` (Phase 3 placeholder). The existing sparse fields (`sink_size`, `local_window`, `hash_budget`, `use_sparse`) were already present as Phase 1 placeholders and are now active.
+Added `use_attention_retrieval: bool = False` (now active in Phase 3). The existing sparse fields (`sink_size`, `local_window`, `hash_budget`, `use_sparse`) were already present as Phase 1 placeholders and are now active.
 
 #### `scripts/run_phase2.py` — NEW
 
@@ -490,6 +501,300 @@ The JSON structure for Phase 2:
   },
   "results_by_config": { "dense": [...], "spire_b5": [...], "spire_b6": [...] },
   "phase": 2
+}
+```
+
+---
+
+---
+
+## Phase 3 — Attention-Guided Retrieval
+
+### Why Phase 3 Is Needed
+
+Phases 1 and 2 both retrieve using **BM25** — a keyword-overlap scoring function. BM25 has two well-known failure modes in multi-hop reasoning:
+
+1. **Vocabulary mismatch.** The model's reasoning step (the BM25 query) may use paraphrased or inferred language that does not share exact keywords with the passage that actually contains the next needed fact. BM25 will miss it; a model that understands the semantics would not.
+
+2. **Ignoring what the model already knows.** BM25 scores passages independently of what the model has already reasoned. If the model has just concluded "the CEO of company X is Alice", BM25 would not naturally prioritise the passage about Alice's background over an unrelated passage that happens to contain the word "CEO".
+
+Phase 3 asks: **can the model's own attention weights — the mechanism it uses to focus its reasoning — be repurposed as a retrieval signal?** If the reasoning tokens are strongly attending to a passage's tokens, that is strong evidence that the model considers that passage relevant to the next step, regardless of surface-level keyword overlap.
+
+This is the **AttentionRetriever** concept from Fu et al. (2026, arXiv:2602.12278). Phase 3 implements it and combines it with the Phase 2 sparse attention generation to produce the B7 configuration — the novel contribution of this project.
+
+---
+
+### The Core Idea — Retrieval as Self-Attention Readout
+
+At generation step `k`, the model has produced reasoning text `r₁ … rₖ`. These tokens exist inside the context window and have **already attended** to all earlier tokens during their generation. The attention matrix records exactly which tokens each reasoning token found important.
+
+The key insight: the attention weights from reasoning tokens to passage tokens are a readout of **relevance as computed by the model itself**. A passage that reasoning token `rₖ[i]` attended to strongly is one the model was "looking at" while producing that token — it is likely to contain facts that matter for the next hop.
+
+```
+Context window during attention scoring:
+
+[SYS + Question] [Passage_1 tokens] [Passage_2 tokens] … [Passage_N tokens] [Reasoning tokens]
+↑ anchor           ↑────────────────── scored passages ──────────────────↑   ↑ query tokens ↑
+
+For each reasoning token rᵢ and each passage pⱼ:
+  score(pⱼ, rᵢ) = max_{token t in pⱼ} attention(rᵢ → t)    ← max over passage tokens
+
+Final score for passage pⱼ:
+  = mean over reasoning tokens of score(pⱼ, rᵢ)
+    averaged over attention heads
+    averaged over target layers (second half of the network)
+```
+
+**Why use the second half of the network?**  
+The first half of a transformer does most of the token-level feature extraction; the second half does semantic integration and factual recall. The attention patterns in the later layers better reflect "what this token is reasoning about" rather than "what syntactic features are nearby". This is consistent with findings from mechanistic interpretability work and is the layer selection used in the AttentionRetriever paper.
+
+**Why `max` over passage tokens and `mean` over reasoning tokens?**  
+A passage is relevant if *any* of its tokens are strongly attended to (max captures that a specific key fact was looked up). The reasoning is relevant across *all* its tokens, so averaging across them gives a stable signal.
+
+---
+
+### How AttentionRetriever Works Technically
+
+#### Step 1 — Build the input sequence
+
+```
+Tokenise: [Question prefix] [Passage_0] [Passage_1] … [Passage_N] [Reasoning text]
+
+Track token position ranges:
+  passage_ranges[i] = (start_token_idx, end_token_idx)   for passage i
+  reasoning_range   = (start_token_idx, end_token_idx)   for the reasoning block
+```
+
+The passages are inserted verbatim (no formatting markup). The reasoning text is the concatenation of all reasoning steps generated so far, prepended with `"Reasoning: "`. The question is the prefix anchor.
+
+#### Step 2 — Single forward pass with attention output
+
+```python
+outputs = model.forward(
+    input_ids=input_ids,
+    output_attentions=True,          # returns attention maps for every layer
+)
+# outputs.attentions: tuple of (batch=1, heads, seq_len, seq_len) per layer
+```
+
+One forward pass on the full sequence — **not** a generation call. No tokens are generated here; we only need the attention maps.
+
+#### Step 3 — Score each passage
+
+```python
+for layer_idx in target_layers:       # second half of the network
+    layer_attn = outputs.attentions[layer_idx][0]  # (heads, seq, seq)
+    for passage_i, (p_start, p_end) in enumerate(passage_ranges):
+        # reasoning tokens attending to passage tokens
+        attn_slice = layer_attn[:, r_start:r_end, p_start:p_end]  # (heads, r_len, p_len)
+        # max over passage tokens → (heads, r_len), then mean over heads+reasoning
+        scores[passage_i] += attn_slice.max(dim=-1).values.mean()
+
+scores = [s / len(target_layers) for s in scores]   # average over layers
+```
+
+Attention maps are moved to CPU immediately (`layer_attn_cpu = layer_attn[0].cpu().float()`) and deleted after scoring to avoid accumulating GPU memory.
+
+#### Step 4 — Return top-k passages
+
+```python
+ranked = sorted(range(len(passages)), key=lambda i: scores[i], reverse=True)
+return [passages[i] for i in ranked[:top_k]]
+```
+
+The highest-scoring passages are returned — those are the ones the model's reasoning attended to most.
+
+---
+
+### Memory Safety and the BM25 Fallback
+
+`output_attentions=True` stores a `(heads, seq_len, seq_len)` float tensor per layer. Memory scales as:
+
+$$\text{Memory} \approx n\_\text{layers} \times n\_\text{heads} \times \text{seq\_len}^2 \times \text{bytes\_per\_float}$$
+
+For a 32-layer 8B model with `seq_len = 4096` in bfloat16: ≈ 17 GB — manageable on an A100-40GB on top of the 16 GB model weights.
+
+On a CPU laptop with the 1B model: even `seq_len = 1500` is safe (~200 MB).
+
+But MuSiQue examples have ~20 paragraphs of ~100 tokens each. The full passage pool can easily exceed the guard threshold. Two safety mechanisms handle this:
+
+| Guard | Condition | Action |
+|---|---|---||
+| Sequence length guard | `input_ids.shape[-1] > attn_retrieval_max_seq` | Fall back to BM25 on the last reasoning step |
+| Hop-0 guard | `reasoning_so_far` is empty (no reasoning yet) | Fall back to BM25 on the question itself |
+
+`attn_retrieval_max_seq` is a config parameter: **1 500 by default** (safe on CPU laptop), **raise to 4 096 on A100**. When the guard triggers, the BM25 fallback retrieves normally — the system degrades gracefully to Phase 1/2 behaviour rather than crashing.
+
+---
+
+### Files Added or Patched in Phase 3
+
+#### `src/attention_retriever.py` — NEW
+
+The `AttentionRetriever` class.
+
+| Method | Purpose |
+|---|---|
+| `__init__(model, passages, bm25_retriever, max_seq_len)` | Store model reference, passage pool, BM25 fallback, and sequence length guard. Compute `target_layer_indices = range(num_layers//2, num_layers)` |
+| `retrieve(question, reasoning_so_far, top_k)` | Public entry point: handle hop-0 guard, call `_build_input`, check seq-len guard, run forward pass, call `_score_passages`, return top-k |
+| `_build_input(question, reasoning_text)` | Tokenise `[prefix \| p₀ \| p₁ \| … \| reasoning]` and return `(input_ids, passage_ranges, reasoning_range)` |
+| `_score_passages(attentions, passage_ranges, reasoning_range)` | For each target layer and each passage, compute the max-then-mean attention score; average over layers; return a score list |
+
+#### `src/ircot_loop.py` — PATCHED
+
+Three changes, all backward-compatible:
+
+1. **`__init__` signature** — added optional `attention_retriever=None` parameter. Phases 1 and 2 never pass this argument; it defaults to `None` and is ignored.
+
+2. **Retrieval branch in `run()`** — the single `retriever.retrieve(...)` call is now guarded:
+   ```python
+   if self.config.use_attention_retrieval and self.attention_retriever is not None:
+       passages = self.attention_retriever.retrieve(
+           question=question,
+           reasoning_so_far=reasoning_so_far,
+           top_k=self.config.retrieval_top_k,
+       )
+   else:
+       passages = self.retriever.retrieve(current_query, top_k=self.config.retrieval_top_k)
+   ```
+   When `use_attention_retrieval=False` (the default), the `else` branch executes — behaviour is identical to Phases 1 and 2.
+
+3. **Truncation in `_build_messages()`** — added the B3 (IRCoT-Truncate) logic:
+   ```python
+   if self.config.truncate_context_tokens > 0 and (evidence_text or reasoning_text):
+       combined = f"Evidence:\n{evidence_text}\n\nPrevious reasoning:\n{reasoning_text}"
+       token_ids = tokenizer.encode(combined)
+       if len(token_ids) > self.config.truncate_context_tokens:
+           token_ids = token_ids[-self.config.truncate_context_tokens:]   # keep LAST N
+           combined = tokenizer.decode(token_ids)
+       user_prompt = f"Question: {question}\n\n{combined}\n\nContinue reasoning..."
+   ```
+   When `truncate_context_tokens=0` (the default), this branch is skipped entirely.
+
+#### `config.py` — PATCHED
+
+Two fields added:
+
+| Field | Default | Description |
+|---|---|---|
+| `truncate_context_tokens` | `0` | 0 = no truncation. Set to `4096` to enable B3 (IRCoT-Truncate) |
+| `attn_retrieval_max_seq` | `1500` | Max input sequence length for attention retrieval. Raise to `4096` on A100 |
+
+`use_attention_retrieval: bool = False` was already present as a Phase 2 placeholder — it is now active.
+
+#### `scripts/run_phase3.py` — NEW
+
+Orchestrates the five-configuration comparison. Key design decisions:
+
+- **Model is loaded once** and shared across all five configs. This avoids the ~30-second model load penalty per config.
+- **Prior results are reused**: Phase 1 dense results (B2) and Phase 2 SPIRE-Full results (B6) are loaded from disk if available, saving significant computation on each Phase 3 re-run.
+- **B1 is implemented directly** in the script (not via `IRCoTLoop`) — it does a single BM25 retrieval on the question, builds one prompt, and generates one answer. This is simpler and avoids confusing it with the loop-based configs.
+- **B7 builds `AttentionRetriever` per example** — this is correct because each MuSiQue example has its own passage pool; the retriever must be reconstructed with the per-example passages.
+- **`_run_with_memory`** is a local helper that mirrors the `IRCoTLoop.run()` logic but additionally records `torch.cuda.memory_allocated()` at each hop for the memory plot.
+
+---
+
+### Baselines Run in Phase 3
+
+| ID | Name | Config flags | Description |
+|---|---|---|---|
+| B1 | Retrieve-Once | — | Single BM25 query on the question → one generation call. No loop. **Lower bound** — shows what happens without iterative retrieval |
+| B2 | Dense IRCoT | `use_sparse=False` | Full dense attention IRCoT. Loaded from Phase 1 if available |
+| B3 | IRCoT-Truncate | `truncate_context_tokens=4096` | Dense IRCoT but accumulated evidence + reasoning truncated to last 4 096 tokens. **Naïve compression baseline** — shows that simply discarding old context hurts accuracy |
+| B6 | SPIRE-Full | `use_sparse=True, hash_budget=256` | Phase 2 sparse attention. Loaded from Phase 2 if available |
+| B7 | SPIRE + Attention | `use_sparse=True, use_attention_retrieval=True` | **Phase 3 novel contribution.** Combines Phase 2 sparse generation with Phase 3 attention-guided retrieval |
+
+The intended result: **B7 ≥ B6 > B2 > B3 > B1** on F1, particularly at deeper hop depths (3-hop, 4-hop). B3's F1 degrading relative to B2 validates that truncation is harmful. B7 improving over B6 validates that attention-guided retrieval adds signal beyond what BM25 provides under the sparse attention regime.
+
+---
+
+### Phase 3 Data Flow
+
+```
+Same question/dataset loading as Phase 1/2
+        │
+        ├──► [B1 Retrieve-Once]
+        │        │
+        │    BM25.retrieve(question, top_k=3)
+        │        │
+        │    ModelManager.generate([sys + Q + evidence])
+        │        │
+        │    extract_answer() → result
+        │
+        ├──► [B2 Dense IRCoT]    Load from results/phase1/ (skip re-run)
+        │
+        ├──► [B3 IRCoT-Truncate]
+        │        │
+        │    IRCoTLoop  (truncate_context_tokens=4096)
+        │        │
+        │    ┌── Hop k:
+        │    │     BM25.retrieve(current_query)  →  passages
+        │    │     _build_messages() → truncates [evidence+reasoning] to last 4096 tokens
+        │    │     ModelManager.generate(truncated prompt)  →  rₖ
+        │    └── Repeat until answer or max_hops
+        │
+        ├──► [B6 SPIRE-Full]     Load from results/phase2/ (skip re-run)
+        │
+        └──► [B7 SPIRE + Attention]
+                 │
+             For each example:
+               Build BM25Retriever(passages)        ← always available as fallback
+               Build AttentionRetriever(model, passages, bm25)
+               IRCoTLoop  (use_sparse=True, use_attention_retrieval=True)
+                 │
+             ┌── Hop k:
+             │     AttentionRetriever.retrieve(question, reasoning_so_far)
+             │       ├── Build input: [Q | p₀ | p₁ | … | pN | reasoning_so_far]
+             │       ├── Check seq_len ≤ attn_retrieval_max_seq
+             │       │     If too long → BM25 fallback
+             │       ├── model.forward(output_attentions=True)
+             │       ├── _score_passages() → max-then-mean attention per passage
+             │       └── Return top-k passages
+             │
+             │     _build_messages() → standard prompt (no truncation)
+             │     generate_with_sparse_mask() → rₖ   [sparse attention generation]
+             └── Repeat until answer or max_hops
+        │
+        ▼
+Evaluator → f1_by_hops, overall_f1, overall_em for all 5 configs
+        │
+        ▼
+results/phase3/run_<timestamp>.json
+results/phase3/f1_by_hop_<timestamp>.png          (B1/B2/B3/B6/B7 on same axes)
+results/phase3/context_tokens_<timestamp>.png     (context growth sanity check)
+results/phase3/memory_<timestamp>.png             (GPU memory per hop)
+results/phase3/attn_heatmap_<timestamp>.png       (attention map for first example)
+```
+
+---
+
+### Phase 3 Outputs
+
+| File | Contents |
+|---|---|
+| `run_<timestamp>.json` | Per-example results for all 5 configs, aggregated F1/EM metrics, GPU memory per hop, gold answers, hop depths |
+| `f1_by_hop_<timestamp>.png` | **Key comparison figure** — F1 vs hop depth for B1/B2/B3/B6/B7 on one set of axes |
+| `context_tokens_<timestamp>.png` | Average context growth per hop (sanity check) |
+| `memory_<timestamp>.png` | GPU memory per hop — compare B6 vs B7 to check attention retrieval memory cost |
+| `attn_heatmap_<timestamp>.png` | Attention map (last target layer, averaged over heads) for the first example — diagnostic showing which passage tokens the reasoning tokens attended to |
+
+The JSON structure for Phase 3:
+```json
+{
+  "base_config": { "use_sparse": false, "use_attention_retrieval": false, ... },
+  "configs_run": ["retrieve_once", "dense", "truncate_b3", "spire_b6", "spire_attn"],
+  "metrics_by_config": {
+    "retrieve_once": { "overall_f1": 0.xx, "overall_em": 0.xx, "f1_by_hops": { "2": ..., "3": ... } },
+    "dense":         { ... },
+    "truncate_b3":   { ... },
+    "spire_b6":      { ... },
+    "spire_attn":    { "overall_f1": 0.xx, "overall_em": 0.xx, "f1_by_hops": { ... } }
+  },
+  "memory_by_config": { "dense": [...], "spire_b6": [...], "spire_attn": [...] },
+  "results_by_config": { "retrieve_once": [...], ... },
+  "gold_answers": [...],
+  "hop_depths": [...],
+  "phase": 3
 }
 ```
 
@@ -591,6 +896,38 @@ Phase 2 (`run_phase2.py`) hard-codes the three configs internally. To run only d
 
 ---
 
+## Running Phase 3
+
+From the project root (with the virtual environment active):
+
+```cmd
+python scripts/run_phase3.py
+```
+
+**What the script does automatically:**
+1. Loads the model once (shared across all 5 configs).
+2. Loads MuSiQue (cached from Phase 1).
+3. Checks `results/phase1/` for a B2 dense run — reuses it if found.
+4. Checks `results/phase2/` for a B6 SPIRE-Full run — reuses it if found.
+5. Runs **B1** (retrieve-once) fresh.
+6. Runs **B3** (IRCoT-Truncate, `truncate_context_tokens=4096`) fresh.
+7. Runs **B7** (SPIRE + Attention Retrieval) fresh — this is the slowest config.
+8. Generates the attention heatmap for the first example (skipped automatically if the sequence exceeds `attn_retrieval_max_seq`).
+9. Saves all results and 4 plots to `results/phase3/`.
+10. Prints the final 5-way F1/EM summary table.
+
+**Important:** On a CPU laptop, B7 falls back to BM25 because MuSiQue passage pools are too long for the default `attn_retrieval_max_seq=1500` guard. The run will still complete correctly; B7 will behave like B6 on the laptop. On the A100, raise `attn_retrieval_max_seq` to `4096` to use real attention retrieval.
+
+**Time estimates:**
+
+| Hardware | Model | Examples | Estimated time |
+|---|---|---|---|
+| Laptop (CPU) | Llama-3.2-1B | 1 | ~15 min (B7 slow due to sparse generation) |
+| Laptop (CPU) | Llama-3.2-1B | 10 | ~2–3 hours |
+| A100-40GB | Llama-3.1-8B | 100 | ~4–6 hours (B7 with real attention retrieval) |
+
+---
+
 ## Running on a GPU / Cloud Machine
 
 Only **two lines** in `config.py` need to be changed. Everything else (GPU placement, memory management) is already handled automatically by `device_map="auto"`.
@@ -669,7 +1006,9 @@ All parameters live in `config.py` and apply across all phases:
 | `local_window` | `2048` | **(Phase 2)** Last N tokens always attended — covers current hop's passage + reasoning |
 | `hash_budget` | `256` | **(Phase 2)** Tokens randomly selected from old cycles in the middle region. Set to 0 for B5 (Sink+Local only ablation) |
 | `use_sparse` | `False` | **(Phase 2)** `False` → dense generation (Phase 1 behaviour). `True` → SPIRE sparse generation |
-| `use_attention_retrieval` | `False` | **(Phase 3 placeholder)** When True, replaces BM25 with attention-map-guided retrieval |
+| `use_attention_retrieval` | `False` | **(Phase 3)** `False` → BM25 retrieval (Phases 1/2 behaviour). `True` → attention-map-guided retrieval via `AttentionRetriever` |
+| `truncate_context_tokens` | `0` | **(Phase 3)** 0 = no truncation. Set to `4096` for B3 (IRCoT-Truncate) baseline |
+| `attn_retrieval_max_seq` | `1500` | **(Phase 3)** Max tokenised sequence length before falling back to BM25. Raise to `4096` on A100 for real attention retrieval |
 
 ---
 

@@ -11,11 +11,27 @@ from src.retriever import BM25Retriever
 class IRCoTLoop:
     """Run an interleaved retrieval and reasoning loop for one question."""
 
-    def __init__(self, model: ModelManager, retriever: BM25Retriever, config: SPIREConfig):
-        """Store model, retriever, and experiment settings."""
+    def __init__(
+        self,
+        model: ModelManager,
+        retriever: BM25Retriever,
+        config: SPIREConfig,
+        attention_retriever=None,
+    ):
+        """Store model, retriever, and experiment settings.
+
+        Args:
+            model:               Shared ModelManager.
+            retriever:           BM25Retriever for this example's passage pool.
+            config:              SPIREConfig with all phase flags.
+            attention_retriever: Optional AttentionRetriever (Phase 3).
+                                 When provided and config.use_attention_retrieval=True,
+                                 replaces BM25 as the retrieval signal after hop 0.
+        """
         self.model = model
         self.retriever = retriever
         self.config = config
+        self.attention_retriever = attention_retriever
 
     def _build_messages(
         self,
@@ -38,12 +54,32 @@ class IRCoTLoop:
             for idx, step in enumerate(reasoning_so_far)
         )
 
-        user_prompt = (
-            f"Question: {question}\n\n"
-            f"Evidence:\n{evidence_text if evidence_text else 'None yet.'}\n\n"
-            f"Previous reasoning:\n{reasoning_text if reasoning_text else 'None yet.'}\n\n"
-            "Continue reasoning step by step."
-        )
+        # B3 — IRCoT-Truncate: keep only the last truncate_context_tokens tokens of
+        # accumulated evidence + reasoning.  This is the naïve compression baseline.
+        if self.config.truncate_context_tokens > 0 and (evidence_text or reasoning_text):
+            combined = (
+                f"Evidence:\n{evidence_text}\n\nPrevious reasoning:\n{reasoning_text}"
+            )
+            token_ids = self.model.tokenizer.encode(
+                combined, add_special_tokens=False
+            )
+            if len(token_ids) > self.config.truncate_context_tokens:
+                token_ids = token_ids[-self.config.truncate_context_tokens :]
+                combined = self.model.tokenizer.decode(
+                    token_ids, skip_special_tokens=True
+                )
+            user_prompt = (
+                f"Question: {question}\n\n"
+                f"{combined}\n\n"
+                "Continue reasoning step by step."
+            )
+        else:
+            user_prompt = (
+                f"Question: {question}\n\n"
+                f"Evidence:\n{evidence_text if evidence_text else 'None yet.'}\n\n"
+                f"Previous reasoning:\n{reasoning_text if reasoning_text else 'None yet.'}\n\n"
+                "Continue reasoning step by step."
+            )
 
         return [
             {"role": "system", "content": system_prompt},
@@ -70,7 +106,22 @@ class IRCoTLoop:
         answer = ""
 
         for _ in range(self.config.max_hops):
-            passages = self.retriever.retrieve(current_query, top_k=self.config.retrieval_top_k)
+            # --- Retrieval ---
+            # Phase 3: attention-guided retrieval replaces BM25 after the first hop.
+            # Phase 1 & 2: always use BM25.
+            if (
+                self.config.use_attention_retrieval
+                and self.attention_retriever is not None
+            ):
+                passages = self.attention_retriever.retrieve(
+                    question=question,
+                    reasoning_so_far=reasoning_so_far,
+                    top_k=self.config.retrieval_top_k,
+                )
+            else:
+                passages = self.retriever.retrieve(
+                    current_query, top_k=self.config.retrieval_top_k
+                )
             retrieved_so_far.extend(passages)
 
             messages = self._build_messages(question, retrieved_so_far, reasoning_so_far)

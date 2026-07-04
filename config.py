@@ -33,11 +33,13 @@ class SPIREConfig:
     hash_budget: int = 256
     use_sparse: bool = False
 
-    # Phase 3 placeholder
+    # Phase 3
     use_attention_retrieval: bool = False
+    truncate_context_tokens: int = 0    # 0 = no truncation; set to 4096 for B3 baseline
+    attn_retrieval_max_seq: int = 1500  # raise to 4096 on A100 so B7 uses real attention
 
     # Evaluation
-    num_examples: int = 2  # quick validation; change to 10/100 for real runs
+    num_examples: int = 1  # quick validation; change to 10/100 for real runs
     output_dir: str = "results/phase1"
 
     def output_path(self) -> Path:
