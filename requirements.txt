@@ -1,0 +1,10 @@
+torch>=2.0
+transformers>=4.40
+accelerate
+datasets
+rank-bm25
+evaluate
+matplotlib
+tqdm
+python-dotenv
+gdown
