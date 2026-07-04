@@ -27,14 +27,17 @@ class SPIREConfig:
     # BM25
     bm25_chunk_size: int = 100
 
-    # Sparse (Phase 2 placeholders)
+    # Sparse (Phase 2)
     sink_size: int = 128
     local_window: int = 2048
     hash_budget: int = 256
     use_sparse: bool = False
 
+    # Phase 3 placeholder
+    use_attention_retrieval: bool = False
+
     # Evaluation
-    num_examples: int = 10 # change to 100 later
+    num_examples: int = 2  # quick validation; change to 10/100 for real runs
     output_dir: str = "results/phase1"
 
     def output_path(self) -> Path:

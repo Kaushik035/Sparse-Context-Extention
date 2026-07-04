@@ -1,12 +1,15 @@
 """Model loading and text generation utilities for SPIRE."""
 
 import os
-from typing import Dict, List
+from typing import TYPE_CHECKING, Dict, List
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from config import SPIREConfig
+
+if TYPE_CHECKING:
+    from src.sparse_attention import SparseAttentionMask
 
 
 class ModelManager:
@@ -92,3 +95,79 @@ class ModelManager:
         """Return token length for chat-formatted messages."""
         input_ids = self._prepare_inputs(messages)
         return int(input_ids.shape[-1])
+
+    # ------------------------------------------------------------------
+    # Phase 2 — sparse-attention generation
+    # ------------------------------------------------------------------
+
+    def generate_with_sparse_mask(
+        self,
+        messages: List[Dict[str, str]],
+        mask_builder: "SparseAttentionMask",
+        max_new_tokens: int = 256,
+    ) -> str:
+        """Generate with SPIRE sparse attention applied at every generation step.
+
+        Strategy:
+          1. Run a full dense prefill over the prompt to populate the KV cache.
+          2. Generate each subsequent token using a 1D sparse attention mask that
+             controls which past KV entries the model may attend to (sink + local
+             window + random-hash selection from old cycles).
+
+        This keeps all context tokens accessible (no information loss vs truncation)
+        but concentrates the model's attention budget on fresh evidence and the
+        original question — exactly the SPIRE policy described in the research proposal.
+
+        Args:
+            messages:       Chat-formatted messages (same format as generate()).
+            mask_builder:   SparseAttentionMask instance with configured parameters.
+            max_new_tokens: Maximum tokens to generate.
+
+        Returns:
+            Generated text only (prompt stripped).
+        """
+        input_ids = self._prepare_inputs(messages)
+        input_len = int(input_ids.shape[-1])
+        device    = input_ids.device
+
+        # ---- Step 1: dense prefill — build KV cache ----
+        with torch.no_grad():
+            prefill_out = self.model(
+                input_ids=input_ids,
+                use_cache=True,
+            )
+
+        past_key_values = prefill_out.past_key_values
+        next_logits     = prefill_out.logits[:, -1, :]   # logits at the last prompt position
+
+        generated_ids: List[int] = []
+
+        # ---- Step 2: sparse generation loop ----
+        for step in range(max_new_tokens):
+            next_token = next_logits.argmax(dim=-1, keepdim=True)   # (1, 1)
+            generated_ids.append(int(next_token.item()))
+
+            if next_token.item() == self.tokenizer.eos_token_id:
+                break
+
+            # total_len covers: all prompt positions + tokens generated so far.
+            # The new token we just appended is at position (input_len + step).
+            # For the NEXT step the KV cache will contain input_len + step + 1 entries,
+            # so the attention_mask needs to cover exactly that many positions.
+            total_len = input_len + step + 1
+            sparse_1d  = mask_builder.build_generation_mask(total_len)       # (total_len,)
+            attn_mask  = sparse_1d.unsqueeze(0).to(device)                   # (1, total_len)
+
+            with torch.no_grad():
+                step_out = self.model(
+                    input_ids=next_token,
+                    attention_mask=attn_mask,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+
+            past_key_values = step_out.past_key_values
+            next_logits     = step_out.logits[:, -1, :]
+
+        self.generated_token_counts.append(len(generated_ids))
+        return self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()

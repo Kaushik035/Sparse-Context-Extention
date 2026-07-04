@@ -14,8 +14,17 @@
   - [Architecture and Data Flow](#architecture-and-data-flow)
   - [Module Breakdown](#module-breakdown)
   - [Outputs](#outputs)
+- [Phase 2 — Sparse Attention Integration](#phase-2--sparse-attention-integration)
+  - [Why Phase 2 Is Needed](#why-phase-2-is-needed)
+  - [The SPIRE Sparse Attention Policy](#the-spire-sparse-attention-policy)
+  - [How Sparse Generation Works Technically](#how-sparse-generation-works-technically)
+  - [Files Added or Patched in Phase 2](#files-added-or-patched-in-phase-2)
+  - [Baselines Run in Phase 2](#baselines-run-in-phase-2)
+  - [Phase 2 Data Flow](#phase-2-data-flow)
+  - [Phase 2 Outputs](#phase-2-outputs)
 - [Setup and Installation](#setup-and-installation)
 - [Running Phase 1](#running-phase-1)
+- [Running Phase 2](#running-phase-2)
 - [Running on a GPU / Cloud Machine](#running-on-a-gpu--cloud-machine)
 - [Configuration Reference](#configuration-reference)
 - [Security Notes](#security-notes)
@@ -41,7 +50,7 @@ This allows more productive reasoning hops to fit into the same context window w
 | Phase | Focus | Status |
 |---|---|---|
 | Phase 1 | Reproduce IRCoT on MuSiQue, profile context growth and F1 degradation | **Complete** |
-| Phase 2 | Add sparse attention (SPIRE) and compare against dense baselines | Planned |
+| Phase 2 | Add sparse attention (SPIRE) and compare against dense baselines | **Complete** |
 | Phase 3 | Replace BM25 with attention-guided retrieval | Planned |
 
 ---
@@ -60,21 +69,23 @@ SURP/
 │
 ├── src/
 │   ├── __init__.py
-│   ├── model_manager.py            # HuggingFace model loading + generation
+│   ├── model_manager.py            # Model loading, dense generation, sparse generation
 │   ├── retriever.py                # BM25 retriever
-│   ├── ircot_loop.py               # Interleaved retrieval-reasoning loop
-│   └── evaluator.py                # F1 / EM evaluation utilities
+│   ├── ircot_loop.py               # IRCoT loop — switches between dense/sparse via config
+│   ├── evaluator.py                # F1 / EM evaluation utilities
+│   └── sparse_attention.py         # Phase 2: SPIRE sparse mask builder + visualiser
 │
 ├── scripts/
-│   ├── run_phase1.py               # Phase 1 experiment entrypoint
-│   ├── run_phase2.py               # Phase 2 (planned)
+│   ├── run_phase1.py               # Phase 1: dense IRCoT baseline
+│   ├── run_phase2.py               # Phase 2: dense vs SPIRE-B5 vs SPIRE-B6
 │   └── run_phase3.py               # Phase 3 (planned)
 │
 ├── data/
 │   └── musique/                    # Auto-downloaded on first run
 │
 └── results/
-    └── phase1/                     # JSON artifacts + plots saved here
+    ├── phase1/                     # Phase 1 JSON artifacts + plots
+    └── phase2/                     # Phase 2 JSON artifacts + comparison plots
 ```
 
 ---
@@ -267,6 +278,223 @@ The JSON structure:
 
 ---
 
+## Phase 2 — Sparse Attention Integration
+
+### Why Phase 2 Is Needed
+
+Phase 1 established the problem: as the IRCoT loop accumulates more retrieved passages and reasoning steps, the context window fills up, and the model gives **equal dense attention to every single token** — including stale evidence from hop 1 when it is now working on hop 4. This wastes the limited attention budget on content that is no longer critical and dilutes focus on the fresh evidence that matters most right now.
+
+Phase 2 addresses this by applying a **structured sparse attention policy** during generation, allowing the model to focus its attention budget on what matters while still being able to access all past context if truly needed. Unlike truncation (which throws away old tokens entirely), sparse attention keeps all tokens in the window but dramatically reduces how much "budget" they consume.
+
+---
+
+### The SPIRE Sparse Attention Policy
+
+At every generation step inside the IRCoT loop, the SPIRE policy divides the accumulated context into three regions and assigns a different attention behaviour to each:
+
+```
+Context window at hop k:
+
+┌─────────────────────────────────────────────────────────────────┐
+│  [SYS + Q]  │  p₁ r₁  │  p₂ r₂  │  ...  │  pₖ₋₁ rₖ₋₁  │  pₖ  │
+└─────────────────────────────────────────────────────────────────┘
+  ↑ SINK        ↑──── MIDDLE (old cycles) ────↑   ↑ LOCAL WINDOW ↑
+  always dense   sparse (random hash budget)       always dense
+```
+
+| Region | Policy | Size | Why |
+|---|---|---|---|
+| **Sink** | Always attended | First `sink_size=128` tokens | System prompt + question are the anchor for every reasoning step — they must never be masked out |
+| **Local window** | Always attended (dense) | Last `local_window=2048` tokens | The current hop's retrieved passage + the reasoning being generated right now — highest priority, always needs full focus |
+| **Middle** | Sparse (random / hash selection) | `hash_budget=256` tokens selected from all older cycles | Old passages and reasoning steps are still accessible for reference but don't consume the full attention budget |
+
+**Why not just truncate?** Truncation is irreversible — if an earlier hop contained a critical entity, truncating it means the model permanently loses access to it. Sparse attention keeps every token in the window (no information loss) but assigns them a lower attention budget.
+
+**Why not summarise?** Summarisation introduces its own compression loss (and is itself a baseline — B4 in the experiments). It also adds generation cost at every hop.
+
+---
+
+### How Sparse Generation Works Technically
+
+The HuggingFace `generate()` API does not accept a 2D causal attention mask. Phase 2 uses a **manual KV-cached generation loop** instead:
+
+```
+Step 1 — Dense Prefill:
+  model.forward(full_prompt, use_cache=True)
+  → Builds the KV cache for all prompt tokens with FULL dense attention.
+  → Returns the KV cache + logits for the first generated token.
+  → Why dense here? The prompt just needs to be encoded; the attention
+    pattern that matters for research is what happens during generation.
+
+Step 2 — Sparse Generation Loop (per token):
+  for each new token at position t:
+    sparse_mask = build_generation_mask(total_len=input_len + t + 1)
+    # sparse_mask is a 1D tensor: 1 = attend, 0 = skip
+    # Covers: sink positions + local window + randomly-selected middle positions
+
+    model.forward(
+        input_ids  = next_token,          # just 1 new token
+        attention_mask = sparse_mask,     # (1, total_len) — controls KV access
+        past_key_values = kv_cache,       # all past KV states still available
+        use_cache = True,
+    )
+```
+
+Key properties of this design:
+- **KV cache is used** — each step processes only 1 new token, not the full sequence. This keeps generation speed reasonable.
+- **All past KV states remain in memory** — the sparse mask controls *which* KV states to attend to, but the states themselves are not deleted. No information loss.
+- **Sink + local positions always get mask=1** — they receive full attention at every generation step.
+- **Middle positions get mask=1 for only `hash_budget` randomly-chosen positions** — the rest get mask=0 and are skipped.
+- **Backward compatible** — `use_sparse=False` in `config.py` routes the loop through the original `model.generate()` call, giving identical Phase 1 behaviour.
+
+---
+
+### Files Added or Patched in Phase 2
+
+#### `src/sparse_attention.py` — NEW
+
+The `SparseAttentionMask` class. The core of Phase 2.
+
+| Method | Purpose |
+|---|---|
+| `build_mask(seq_len)` | Build a full 2D boolean causal mask — used for visualisation and analysis |
+| `build_generation_mask(total_len)` | Build the 1D mask for a single KV-cached generation step. Returns a `LongTensor` of shape `(total_len,)`: 1 = attend, 0 = skip |
+| `sparsity(seq_len)` | Return the fraction of causal attention entries that are skipped at a given sequence length |
+| `visualize(seq_len, save_path)` | Save a heatmap of the attention pattern to a PNG file |
+
+The three mask components in `build_generation_mask`:
+```python
+# Sink: first sink_size tokens always 1
+mask[:min(self.sink_size, total_len)] = 1
+
+# Local window: last local_window tokens always 1
+local_start = max(0, new_pos - self.local_window + 1)
+mask[local_start:total_len] = 1
+
+# Hash / random: select hash_budget positions from the middle gap
+middle_positions = torch.arange(middle_start, middle_end)
+perm = torch.randperm(len(middle_positions))[:hash_budget]
+mask[middle_positions[perm]] = 1
+```
+
+#### `src/model_manager.py` — PATCHED
+
+Added `generate_with_sparse_mask(messages, mask_builder, max_new_tokens)`. No existing methods changed — Phase 1 behaviour is fully preserved.
+
+#### `src/ircot_loop.py` — PATCHED
+
+A 3-line branch was inserted before the `model.generate()` call:
+```python
+if self.config.use_sparse:
+    # Phase 2: sparse generation
+    mask_builder = SparseAttentionMask(sink_size, local_window, hash_budget)
+    response = self.model.generate_with_sparse_mask(messages, mask_builder, max_new_tokens)
+else:
+    # Phase 1: dense generation — identical to original
+    response = self.model.generate(messages, max_new_tokens)
+```
+
+#### `config.py` — PATCHED
+
+Added `use_attention_retrieval: bool = False` (Phase 3 placeholder). The existing sparse fields (`sink_size`, `local_window`, `hash_budget`, `use_sparse`) were already present as Phase 1 placeholders and are now active.
+
+#### `scripts/run_phase2.py` — NEW
+
+Orchestrates the three-way comparison. Key logic:
+1. Tries to load the most recent Phase 1 JSON from `results/phase1/` as the dense baseline — avoids re-running B2 if results already exist.
+2. Runs B5 (`use_sparse=True, hash_budget=0`) — Sink + Local only, no middle-region selection.
+3. Runs B6 (`use_sparse=True, hash_budget=256`) — full SPIRE with random hash selection.
+4. Tracks GPU memory at each hop via `torch.cuda.memory_allocated()`.
+5. Saves a single JSON artifact + 4 plots.
+
+---
+
+### Baselines Run in Phase 2
+
+| ID | Name | Config | Description |
+|---|---|---|---|
+| B2 | Dense IRCoT | `use_sparse=False` | Full dense attention — loaded from Phase 1 results if available |
+| B5 | SPIRE Sink+Local | `use_sparse=True, hash_budget=0` | Ablation: only sink + local window, no sparse selection from old cycles |
+| B6 | SPIRE Full | `use_sparse=True, hash_budget=256` | Full SPIRE: sink + local + random selection from middle |
+
+B5 is an ablation that answers the question: *does the hash/random selection from old cycles actually contribute, or does the local window alone explain any gains?*
+
+---
+
+### Phase 2 Data Flow
+
+```
+Same question/dataset loading as Phase 1
+        │
+        ├──► [B2 Dense]    Load from results/phase1/ (skip re-run)
+        │
+        ├──► [B5 Sink+Local]
+        │        │
+        │    IRCoT loop  (use_sparse=True, hash_budget=0)
+        │        │
+        │    generate_with_sparse_mask()
+        │        │
+        │    ┌── Prefill: dense forward, build KV cache
+        │    └── Per-token loop:
+        │            mask = sink(128) ∪ local(2048)  [no middle]
+        │            model.forward(token, mask, past_kv)
+        │
+        └──► [B6 SPIRE Full]
+                 │
+             IRCoT loop  (use_sparse=True, hash_budget=256)
+                 │
+             generate_with_sparse_mask()
+                 │
+             ┌── Prefill: dense forward, build KV cache
+             └── Per-token loop:
+                     mask = sink(128) ∪ local(2048) ∪ random(256 from middle)
+                     model.forward(token, mask, past_kv)
+        │
+        ▼
+Evaluator  →  f1_by_hops, overall_f1, overall_em
+        │
+        ▼
+results/phase2/run_<timestamp>.json
+results/phase2/f1_by_hop_<timestamp>.png        (B2 vs B5 vs B6 on same axes)
+results/phase2/context_tokens_<timestamp>.png   (context growth, sanity check)
+results/phase2/memory_<timestamp>.png           (GPU memory per hop)
+results/phase2/mask_pattern_<timestamp>.png     (SPIRE attention pattern heatmap)
+```
+
+---
+
+### Phase 2 Outputs
+
+| File | Contents |
+|---|---|
+| `run_<timestamp>.json` | Per-example results for all 3 configs + aggregated metrics + GPU memory per hop |
+| `f1_by_hop_<timestamp>.png` | **Key comparison figure** — F1 at each hop depth for B2 / B5 / B6 on one plot |
+| `context_tokens_<timestamp>.png` | Average context token count per hop (same across configs — confirms window growth) |
+| `memory_<timestamp>.png` | GPU memory allocated (GB) at each hop — shows memory cost difference |
+| `mask_pattern_<timestamp>.png` | Heatmap of the SPIRE sparse attention pattern for seq_len=1000 — shows sparsity visually |
+
+The JSON structure for Phase 2:
+```json
+{
+  "base_config": { "sink_size": 128, "local_window": 2048, "hash_budget": 256, ... },
+  "configs_run": ["dense", "spire_b5", "spire_b6"],
+  "metrics_by_config": {
+    "dense":    { "overall_f1": 0.xx, "f1_by_hops": { "2": ..., "3": ..., "4": ... } },
+    "spire_b5": { "overall_f1": 0.xx, "f1_by_hops": { ... } },
+    "spire_b6": { "overall_f1": 0.xx, "f1_by_hops": { ... } }
+  },
+  "memory_by_config": {
+    "dense":    [GB_hop1, GB_hop2, ...],
+    "spire_b5": [...],
+    "spire_b6": [...]
+  },
+  "results_by_config": { "dense": [...], "spire_b5": [...], "spire_b6": [...] },
+  "phase": 2
+}
+```
+
+---
+
 ## Setup and Installation
 
 ### Prerequisites
@@ -327,6 +555,39 @@ python scripts/run_phase1.py
 4. Saves results and plots to `results/phase1/`.
 
 **On subsequent runs**, cached model weights and the dataset are reused — startup takes only a few seconds.
+
+---
+
+## Running Phase 2
+
+From the project root (with the virtual environment active):
+
+```cmd
+python scripts/run_phase2.py
+```
+
+**What the script does automatically:**
+1. Loads the model (shared across all three configs — loaded once).
+2. Loads MuSiQue (uses the cached download from Phase 1).
+3. Checks `results/phase1/` for an existing run artifact — if found, reuses those dense B2 results instead of re-running, saving ~half the total time.
+4. Runs B5 (Sink+Local sparse) on all `num_examples` questions.
+5. Runs B6 (Full SPIRE sparse) on all `num_examples` questions.
+6. Saves the combined JSON artifact and four plots to `results/phase2/`.
+7. Prints a final summary table: F1 and EM for each config.
+
+**Toggling sparse on/off without editing the script:**  
+Phase 1 (`run_phase1.py`) always runs dense — `use_sparse` is ignored there.  
+Phase 2 (`run_phase2.py`) hard-codes the three configs internally. To run only dense again (e.g., to re-baseline), simply run `python scripts/run_phase1.py` — the Phase 2 patches do not affect it.
+
+**Time estimates:**
+
+| Hardware | Model | Examples | Estimated time |
+|---|---|---|---|
+| Laptop (CPU) | Llama-3.2-1B | 2 | ~40 min |
+| Laptop (CPU) | Llama-3.2-1B | 10 | ~3–4 hours |
+| A100-40GB | Llama-3.1-8B | 100 | ~2–3 hours |
+
+> On the A100 with 100 examples: if Phase 1 results exist, only B5 + B6 run fresh.
 
 ---
 
@@ -404,10 +665,11 @@ All parameters live in `config.py` and apply across all phases:
 | `retrieval_top_k` | `3` | Passages retrieved per BM25 query |
 | `num_examples` | `10` | Questions to evaluate (set to 100+ for real results) |
 | `output_dir` | `results/phase1` | Where JSON artifacts and plots are saved |
-| `sink_size` | `128` | (Phase 2) Always-attended prefix tokens |
-| `local_window` | `2048` | (Phase 2) Dense attention window for current hop |
-| `hash_budget` | `256` | (Phase 2) Sparse tokens selected from old context |
-| `use_sparse` | `False` | (Phase 2) Toggle sparse attention on/off |
+| `sink_size` | `128` | **(Phase 2)** First N tokens always attended — covers system prompt + question |
+| `local_window` | `2048` | **(Phase 2)** Last N tokens always attended — covers current hop's passage + reasoning |
+| `hash_budget` | `256` | **(Phase 2)** Tokens randomly selected from old cycles in the middle region. Set to 0 for B5 (Sink+Local only ablation) |
+| `use_sparse` | `False` | **(Phase 2)** `False` → dense generation (Phase 1 behaviour). `True` → SPIRE sparse generation |
+| `use_attention_retrieval` | `False` | **(Phase 3 placeholder)** When True, replaces BM25 with attention-map-guided retrieval |
 
 ---
 

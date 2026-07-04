@@ -77,7 +77,24 @@ class IRCoTLoop:
             context_length = self.model.get_context_length_from_messages(messages)
             context_tokens_per_hop.append(context_length)
 
-            response = self.model.generate(messages=messages, max_new_tokens=self.config.max_new_tokens)
+            # Phase 1: dense generation.  Phase 2: sparse generation when use_sparse=True.
+            if self.config.use_sparse:
+                from src.sparse_attention import SparseAttentionMask
+                mask_builder = SparseAttentionMask(
+                    sink_size=self.config.sink_size,
+                    local_window=self.config.local_window,
+                    hash_budget=self.config.hash_budget,
+                )
+                response = self.model.generate_with_sparse_mask(
+                    messages=messages,
+                    mask_builder=mask_builder,
+                    max_new_tokens=self.config.max_new_tokens,
+                )
+            else:
+                response = self.model.generate(
+                    messages=messages,
+                    max_new_tokens=self.config.max_new_tokens,
+                )
             reasoning_so_far.append(response)
 
             extracted = self._extract_answer(response)
