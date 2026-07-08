@@ -860,6 +860,7 @@ source venv/bin/activate
 ### Step 3 — Install dependencies
 
 ```cmd
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt
 ```
 

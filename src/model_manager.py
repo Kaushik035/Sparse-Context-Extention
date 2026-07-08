@@ -36,6 +36,20 @@ class ModelManager:
             dtype=dtype,
             device_map="auto",
         )
+        print("=" * 60)
+        print("Torch CUDA available:", torch.cuda.is_available())
+        print("Model device:", next(self.model.parameters()).device)
+
+        if hasattr(self.model, "hf_device_map"):
+            print("HF Device Map:", self.model.hf_device_map)
+
+        if torch.cuda.is_available():
+            print("GPU:", torch.cuda.get_device_name(0))
+            print(f"Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+            print(f"Reserved : {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+            
+        print("=" * 60)
+
         self.model.eval()
 
         self.generated_token_counts: List[int] = []
