@@ -86,6 +86,60 @@ class IRCoTLoop:
             {"role": "user", "content": user_prompt},
         ]
 
+    def _dedupe_new_passages(self, retrieved_so_far: List[str], new_passages: List[str]) -> List[str]:
+        """Return `new_passages` with any texts already present in `retrieved_so_far` removed, preserving order."""
+        seen = set(retrieved_so_far)
+        unique = []
+        for p in new_passages:
+            if p not in seen:
+                unique.append(p)
+                seen.add(p)
+        return unique
+
+    def _short_query_from_response(self, response: str) -> str:
+        """Try to derive a short retrieval query from model response.
+
+        Strategy: take first sentence if short; otherwise ask model to produce
+        a one-line query using a deterministic generation call.
+        """
+        # naive first-sentence extraction
+        first_line = response.splitlines()[0].strip()
+        # first sentence up to first period
+        first_sent = first_line.split(".")[0].strip()
+        if 0 < len(first_sent) <= 200 and len(first_sent.split()) <= 30:
+            return first_sent
+
+        # fallback: ask model to produce a short query
+        system = "You are an assistant that writes concise search queries (one line, <=12 words)."
+        user = (
+            "From the reasoning below, write a single-line search query (<=12 words) "
+            "that would retrieve the most relevant evidence. Do not add explanation.\n\n"
+            f"{response}\n\nQuery:"
+        )
+        try:
+            q = self.model.generate([{"role": "system", "content": system}, {"role": "user", "content": user}], max_new_tokens=32)
+            q = q.strip().splitlines()[0]
+            # sanitize: remove trailing punctuation
+            return q.rstrip(' .')
+        except Exception:
+            # last resort: return the original short first line
+            return first_sent or response[:200]
+
+    def _force_extract_answer(self, response: str) -> str:
+        """When `_extract_answer` fails, ask the model to return the final answer only."""
+        system = (
+            "You are an assistant that extracts the final answer from model reasoning. "
+            "Return the final answer only, no commentary."
+        )
+        user = f"Here is the model's reasoning:\n\n{response}\n\nReturn final answer only:"
+        try:
+            out = self.model.generate([{"role": "system", "content": system}, {"role": "user", "content": user}], max_new_tokens=64)
+            # try to parse with existing extractor first; otherwise return the whole output
+            extracted = self._extract_answer(out)
+            return extracted if extracted else out.strip()
+        except Exception:
+            return ""
+
     def _extract_answer(self, text: str) -> str | None:
         """Extract final answer from model output if it includes answer marker."""
         match = re.search(
@@ -122,7 +176,10 @@ class IRCoTLoop:
                 passages = self.retriever.retrieve(
                     current_query, top_k=self.config.retrieval_top_k
                 )
-            retrieved_so_far.extend(passages)
+            # dedupe newly retrieved passages against already-seen ones
+            new_passages = self._dedupe_new_passages(retrieved_so_far, passages)
+            if new_passages:
+                retrieved_so_far.extend(new_passages)
 
             messages = self._build_messages(question, retrieved_so_far, reasoning_so_far)
             context_length = self.model.get_context_length_from_messages(messages)
@@ -148,14 +205,25 @@ class IRCoTLoop:
                 )
             reasoning_so_far.append(response)
 
+            # Try to extract explicit answer marker. If absent, do not feed the
+            # entire verbose reasoning back into BM25; instead derive a short
+            # search query to avoid retrieval drift.
             extracted = self._extract_answer(response)
             if extracted:
                 answer = extracted
                 break
-            current_query = response
+
+            # produce a short retrieval query for the next hop (robust to long responses)
+            try:
+                current_query = self._short_query_from_response(response)
+            except Exception:
+                current_query = response
 
         if not answer and reasoning_so_far:
-            answer = reasoning_so_far[-1].strip()
+            # If the model never produced the answer marker, ask it to return
+            # the final answer only as a concise fallback.
+            forced = self._force_extract_answer(reasoning_so_far[-1])
+            answer = forced or reasoning_so_far[-1].strip()
 
         return {
             "question": question,
