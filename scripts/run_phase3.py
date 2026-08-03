@@ -276,7 +276,9 @@ def _run_with_memory(
             )
         else:
             passages = loop.retriever.retrieve(current_query, top_k=config.retrieval_top_k)
-        retrieved_so_far.extend(passages)
+        new_passages = loop._dedupe_new_passages(retrieved_so_far, passages)
+        if new_passages:
+            retrieved_so_far.extend(new_passages)
 
         messages = loop._build_messages(question, retrieved_so_far, reasoning_so_far)
         context_length = loop.model.get_context_length_from_messages(messages)
@@ -303,11 +305,14 @@ def _run_with_memory(
         memory_by_hop[hop_idx + 1].append(max(mem_before, gpu_memory_gb()))
         reasoning_so_far.append(response)
 
-        extracted = loop._extract_answer(response)
-        if extracted:
-            answer = extracted
+        directive, value = loop._extract_protocol_directive(response)
+        if directive == "final_answer" and value:
+            answer = value
             break
-        current_query = response
+        if directive == "search_query" and value:
+            current_query = value
+        else:
+            current_query = loop._short_query_from_response(response)
 
     if not answer and reasoning_so_far:
         answer = reasoning_so_far[-1].strip()
@@ -645,46 +650,52 @@ def main() -> None:
     logging.info("Running B8 (cosine retrieval) with model: %s",
                  base_config.dense_retriever_model)
     # Load the sentence-transformer once and reuse for both B8 and B9.
+    shared_st_model = None
     try:
         from sentence_transformers import SentenceTransformer as _SharedST
-    except ImportError as exc:
-        raise ImportError(
-            "sentence-transformers is required for B8/B9. "
-            "Run: pip install sentence-transformers>=2.7"
-        ) from exc
-    shared_st_model = _SharedST(base_config.dense_retriever_model)
-    logging.info("Loaded shared sentence-transformer: %s", base_config.dense_retriever_model)
 
-    cfg_b8 = replace(base_config, use_sparse=False, use_attention_retrieval=False,
-                     truncate_context_tokens=0)
-    r8, mem8 = run_ircot(cfg_b8, model_manager, examples, "B8 cosine",
-                          retrieval_mode="cosine", st_model=shared_st_model)
-    results_by_config["cosine_b8"] = r8
-    memory_by_config["cosine_b8"] = mem8
-    metrics_by_config["cosine_b8"] = evaluator.evaluate_results(
-        r8, gold_answers[:len(r8)], hop_depths[:len(r8)]
-    )
-    logging.info("[B8] F1=%.4f  EM=%.4f", metrics_by_config["cosine_b8"]["overall_f1"],
-                 metrics_by_config["cosine_b8"]["overall_em"])
+        shared_st_model = _SharedST(base_config.dense_retriever_model)
+        logging.info(
+            "Loaded shared sentence-transformer: %s",
+            base_config.dense_retriever_model,
+        )
+    except Exception as exc:
+        logging.warning(
+            "Skipping B8/B9 because the sentence-transformer could not be loaded locally: %s",
+            exc,
+        )
 
-    # ----
-    # B9 — Hybrid Retrieval (BM25 + cosine, equal weight by default)
-    # Tests whether the two retrieval signals are complementary.
-    # Expected: B9 >= B8 and B9 >= B2 (BM25-only dense) when both agree.
-    # ----
-    logging.info("Running B9 (hybrid retrieval) dense_weight=%.2f",
-                 base_config.hybrid_dense_weight)
-    cfg_b9 = replace(base_config, use_sparse=False, use_attention_retrieval=False,
-                     truncate_context_tokens=0)
-    r9, mem9 = run_ircot(cfg_b9, model_manager, examples, "B9 hybrid",
-                          retrieval_mode="hybrid", st_model=shared_st_model)
-    results_by_config["hybrid_b9"] = r9
-    memory_by_config["hybrid_b9"] = mem9
-    metrics_by_config["hybrid_b9"] = evaluator.evaluate_results(
-        r9, gold_answers[:len(r9)], hop_depths[:len(r9)]
-    )
-    logging.info("[B9] F1=%.4f  EM=%.4f", metrics_by_config["hybrid_b9"]["overall_f1"],
-                 metrics_by_config["hybrid_b9"]["overall_em"])
+    if shared_st_model is not None:
+        cfg_b8 = replace(base_config, use_sparse=False, use_attention_retrieval=False,
+                         truncate_context_tokens=0)
+        r8, mem8 = run_ircot(cfg_b8, model_manager, examples, "B8 cosine",
+                              retrieval_mode="cosine", st_model=shared_st_model)
+        results_by_config["cosine_b8"] = r8
+        memory_by_config["cosine_b8"] = mem8
+        metrics_by_config["cosine_b8"] = evaluator.evaluate_results(
+            r8, gold_answers[:len(r8)], hop_depths[:len(r8)]
+        )
+        logging.info("[B8] F1=%.4f  EM=%.4f", metrics_by_config["cosine_b8"]["overall_f1"],
+                     metrics_by_config["cosine_b8"]["overall_em"])
+
+        # ----
+        # B9 — Hybrid Retrieval (BM25 + cosine, equal weight by default)
+        # Tests whether the two retrieval signals are complementary.
+        # Expected: B9 >= B8 and B9 >= B2 (BM25-only dense) when both agree.
+        # ----
+        logging.info("Running B9 (hybrid retrieval) dense_weight=%.2f",
+                     base_config.hybrid_dense_weight)
+        cfg_b9 = replace(base_config, use_sparse=False, use_attention_retrieval=False,
+                         truncate_context_tokens=0)
+        r9, mem9 = run_ircot(cfg_b9, model_manager, examples, "B9 hybrid",
+                              retrieval_mode="hybrid", st_model=shared_st_model)
+        results_by_config["hybrid_b9"] = r9
+        memory_by_config["hybrid_b9"] = mem9
+        metrics_by_config["hybrid_b9"] = evaluator.evaluate_results(
+            r9, gold_answers[:len(r9)], hop_depths[:len(r9)]
+        )
+        logging.info("[B9] F1=%.4f  EM=%.4f", metrics_by_config["hybrid_b9"]["overall_f1"],
+                     metrics_by_config["hybrid_b9"]["overall_em"])
 
     # ---- Attention heatmap (first example, diagnostic) ----
     heatmap_path = output_dir / f"attn_heatmap_{timestamp}.png"
@@ -701,8 +712,7 @@ def main() -> None:
         "configs_run":       [
             "retrieve_once", "dense", "truncate_b3",
             "spire_b6", "spire_attn",
-            "cosine_b8", "hybrid_b9",
-        ],
+        ] + (["cosine_b8", "hybrid_b9"] if shared_st_model is not None else []),
         "metrics_by_config": metrics_by_config,
         "memory_by_config":  memory_by_config,
         "results_by_config": results_by_config,

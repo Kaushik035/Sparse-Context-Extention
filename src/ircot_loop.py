@@ -41,18 +41,19 @@ class IRCoTLoop:
     ) -> List[Dict[str, str]]:
         """Construct chat-formatted messages for the next IRCoT step."""
         system_prompt = (
-            "Answer the question by reasoning step by step. "
-            "When you have the final answer, write 'So the answer is: <answer>'."
+            "You are an IRCoT agent. You only have access to the supplied evidence and the prior reasoning in this chat. "
+            "Do not claim to search the internet, browse the web, or use outside research. "
+            "At each hop, write exactly one concise reasoning step using only the supplied evidence. "
+            "Then end with exactly one final line in one of these formats: Search Query: <query> or Final Answer: <answer>. "
+            "If more evidence is needed, use Search Query. If enough evidence exists, use Final Answer. "
+            "Do not write numbered steps, multiple reasoning steps, or any text after the final line."
         )
 
         evidence_text = "\n\n".join(
             f"[Evidence {idx + 1}] {passage}"
             for idx, passage in enumerate(retrieved_so_far)
         )
-        reasoning_text = "\n".join(
-            f"Step {idx + 1}: {step}"
-            for idx, step in enumerate(reasoning_so_far)
-        )
+        reasoning_text = "\n\n".join(reasoning_so_far)
 
         # B3 — IRCoT-Truncate: keep only the last truncate_context_tokens tokens of
         # accumulated evidence + reasoning.  This is the naïve compression baseline.
@@ -71,20 +72,37 @@ class IRCoTLoop:
             user_prompt = (
                 f"Question: {question}\n\n"
                 f"{combined}\n\n"
-                "Continue reasoning step by step."
+                "Write exactly one concise reasoning step, then end with either 'Search Query: <query>' or 'Final Answer: <answer>'."
             )
         else:
             user_prompt = (
                 f"Question: {question}\n\n"
                 f"Evidence:\n{evidence_text if evidence_text else 'None yet.'}\n\n"
                 f"Previous reasoning:\n{reasoning_text if reasoning_text else 'None yet.'}\n\n"
-                "Continue reasoning step by step."
+                "Write exactly one concise reasoning step, then end with either 'Search Query: <query>' or 'Final Answer: <answer>'."
             )
 
         return [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
+
+    def _extract_protocol_directive(self, text: str) -> tuple[str | None, str | None]:
+        """Extract the final IRCoT directive from model output."""
+        pattern = re.compile(
+            r"(?im)^\s*(search query|final answer|so the answer is)\s*:\s*(.*\S)?\s*$"
+        )
+        matches = pattern.findall(text)
+        if not matches:
+            return None, None
+
+        marker, content = matches[-1]
+        marker = marker.lower().strip()
+        content = (content or "").strip()
+
+        if marker == "search query":
+            return "search_query", content
+        return "final_answer", content
 
     def _dedupe_new_passages(self, retrieved_so_far: List[str], new_passages: List[str]) -> List[str]:
         """Return `new_passages` with any texts already present in `retrieved_so_far` removed, preserving order."""
@@ -126,15 +144,17 @@ class IRCoTLoop:
             return first_sent or response[:200]
 
     def _force_extract_answer(self, response: str) -> str:
-        """When `_extract_answer` fails, ask the model to return the final answer only."""
+        """When the protocol parse fails, ask the model to return the final answer only."""
         system = (
             "You are an assistant that extracts the final answer from model reasoning. "
-            "Return the final answer only, no commentary."
+            "Return exactly one line in the format 'Final Answer: <answer>'."
         )
-        user = f"Here is the model's reasoning:\n\n{response}\n\nReturn final answer only:"
+        user = f"Here is the model's response:\n\n{response}\n\nReturn the final answer only:"
         try:
             out = self.model.generate([{"role": "system", "content": system}, {"role": "user", "content": user}], max_new_tokens=64)
-            # try to parse with existing extractor first; otherwise return the whole output
+            directive, value = self._extract_protocol_directive(out)
+            if directive == "final_answer" and value:
+                return value
             extracted = self._extract_answer(out)
             return extracted if extracted else out.strip()
         except Exception:
@@ -142,6 +162,10 @@ class IRCoTLoop:
 
     def _extract_answer(self, text: str) -> str | None:
         """Extract final answer from model output if it includes answer marker."""
+        directive, value = self._extract_protocol_directive(text)
+        if directive == "final_answer" and value:
+            return value
+
         match = re.search(
             r"(?:the answer is|answer is)[:\s]*(.+?)(?:\.|$)",
             text,
@@ -205,15 +229,18 @@ class IRCoTLoop:
                 )
             reasoning_so_far.append(response)
 
-            # Try to extract explicit answer marker. If absent, do not feed the
-            # entire verbose reasoning back into BM25; instead derive a short
-            # search query to avoid retrieval drift.
-            extracted = self._extract_answer(response)
-            if extracted:
-                answer = extracted
+            # Follow the explicit IRCoT protocol: a hop ends with either a search
+            # query or a final answer.
+            directive, value = self._extract_protocol_directive(response)
+            if directive == "final_answer" and value:
+                answer = value
                 break
+            if directive == "search_query" and value:
+                current_query = value
+                continue
 
-            # produce a short retrieval query for the next hop (robust to long responses)
+            # Fallback for malformed generations: derive a short retrieval query
+            # so the loop can continue without feeding a long chain of thought.
             try:
                 current_query = self._short_query_from_response(response)
             except Exception:

@@ -150,7 +150,9 @@ def _run_with_memory_tracking(
 
     for hop_idx in range(config.max_hops):
         passages = loop.retriever.retrieve(current_query, top_k=config.retrieval_top_k)
-        retrieved_so_far.extend(passages)
+        new_passages = loop._dedupe_new_passages(retrieved_so_far, passages)
+        if new_passages:
+            retrieved_so_far.extend(new_passages)
 
         messages = loop._build_messages(question, retrieved_so_far, reasoning_so_far)
         context_length = loop.model.get_context_length_from_messages(messages)
@@ -180,11 +182,14 @@ def _run_with_memory_tracking(
 
         reasoning_so_far.append(response)
 
-        extracted = loop._extract_answer(response)
-        if extracted:
-            answer = extracted
+        directive, value = loop._extract_protocol_directive(response)
+        if directive == "final_answer" and value:
+            answer = value
             break
-        current_query = response
+        if directive == "search_query" and value:
+            current_query = value
+        else:
+            current_query = loop._short_query_from_response(response)
 
     if not answer and reasoning_so_far:
         answer = reasoning_so_far[-1].strip()
