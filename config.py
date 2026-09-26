@@ -20,7 +20,7 @@ class SPIREConfig:
     device: str = "cuda"
 
     # IRCoT
-    max_hops: int = 4
+    max_hops: int = 12
     max_new_tokens: int = 256
     retrieval_top_k: int = 5
 
@@ -29,13 +29,13 @@ class SPIREConfig:
 
     # Sparse (Phase 2)
     sink_size: int = 128
-    local_window: int = 2048
+    local_window: int = 1024 #2048
     hash_budget: int = 256
     use_sparse: bool = False
 
     # Phase 3
     use_attention_retrieval: bool = False
-    truncate_context_tokens: int = 4096    # 0 = no truncation; set to 4096 for B3 baseline
+    truncate_context_tokens: int = 0    # 0 = no truncation; set to 4096 for B3 baseline
     attn_retrieval_max_seq: int = 4096  # raise to 4096 on A100 so B7 uses real attention
 
     # Phase 3 B8 / B9 — dense and hybrid retrieval

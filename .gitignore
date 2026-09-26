@@ -9,7 +9,6 @@ ENV/
 **/venv/
 **/env/
 **/ENV/
-results/
 data/
 *.pt
 *.bin
